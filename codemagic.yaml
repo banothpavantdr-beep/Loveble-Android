@@ -8,7 +8,55 @@ workflows:
         script: chmod +x gradlew
       - name: Clean existing project
         script: ./gradlew clean
-      - name: Assemble release APK
-        script: ./gradlew assembleRelease
+      - name: Assemble and sign release APK
+        script: |
+          set -e
+
+          ./gradlew assembleRelease
+
+          APK_DIR="app/build/outputs/apk/release"
+          UNSIGNED_APK="$(find "$APK_DIR" -maxdepth 1 -type f -name '*unsigned.apk' -print -quit)"
+          OUTPUT_APK="$APK_DIR/app-release.apk"
+
+          if [ -n "$UNSIGNED_APK" ]; then
+            SIGNING_DIR="${CM_BUILD_DIR:-$(pwd)}/.codemagic-signing"
+            mkdir -p "$SIGNING_DIR"
+            KEYSTORE="$SIGNING_DIR/jarvis-release.keystore"
+            STORE_PASSWORD="jarvis-$(date +%s)-${RANDOM}${RANDOM}"
+
+            keytool -genkeypair \
+              -keystore "$KEYSTORE" \
+              -storepass "$STORE_PASSWORD" \
+              -keypass "$STORE_PASSWORD" \
+              -alias jarvis-release \
+              -keyalg RSA \
+              -keysize 2048 \
+              -validity 10000 \
+              -dname "CN=JARVIS, OU=Android, O=JARVIS, L=India, ST=Karnataka, C=IN"
+
+            APKSIGNER="$(command -v apksigner || find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+            if [ -z "$APKSIGNER" ] || [ ! -x "$APKSIGNER" ]; then
+              echo "Android apksigner was not found."
+              exit 1
+            fi
+
+            "$APKSIGNER" sign \
+              --ks "$KEYSTORE" \
+              --ks-key-alias jarvis-release \
+              --ks-pass "pass:$STORE_PASSWORD" \
+              --key-pass "pass:$STORE_PASSWORD" \
+              --out "$OUTPUT_APK" \
+              "$UNSIGNED_APK"
+          else
+            SIGNED_APK="$(find "$APK_DIR" -maxdepth 1 -type f -name '*.apk' ! -name '*unsigned.apk' -print -quit)"
+            if [ -z "$SIGNED_APK" ]; then
+              echo "No release APK was generated."
+              exit 1
+            fi
+            cp "$SIGNED_APK" "$OUTPUT_APK"
+          fi
+
+          APKSIGNER="$(command -v apksigner || find "${ANDROID_HOME:-$ANDROID_SDK_ROOT}/build-tools" -type f -name apksigner | sort -V | tail -n 1)"
+          "$APKSIGNER" verify --verbose "$OUTPUT_APK"
     artifacts:
-      - app/build/outputs/apk/release/*.apk
+      - app/build/outputs/apk/release/app-release.apk
