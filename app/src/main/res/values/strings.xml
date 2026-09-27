@@ -1,0 +1,8 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name">JARVIS</string>
+    <string name="device_admin_description">Allows JARVIS to lock the screen when you ask.</string>
+    <string name="microphone_channel_name">JARVIS voice control</string>
+    <string name="microphone_channel_description">Voice recognition status for JARVIS.</string>
+    <string name="overlay_service_notification">JARVIS overlay service is active.</string>
+</resources>
