@@ -6,10 +6,14 @@ import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.content.pm.PackageManager
+import android.os.Handler
 import android.os.Bundle
+import android.os.Looper
 import android.speech.RecognitionListener
 import android.speech.RecognizerIntent
 import android.speech.SpeechRecognizer
+import android.speech.tts.TextToSpeech
+import android.speech.tts.UtteranceProgressListener
 import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
@@ -18,6 +22,14 @@ import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.core.RepeatMode
+import androidx.compose.animation.core.animateFloat
+import androidx.compose.animation.core.infiniteRepeatable
+import androidx.compose.animation.core.rememberInfiniteTransition
+import androidx.compose.animation.core.tween
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.layout.Arrangement
@@ -53,13 +65,18 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.shadow
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.StrokeCap
+import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextAlign
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.core.content.ContextCompat
+import kotlin.math.cos
+import kotlin.math.sin
 import java.util.Locale
 
 private val Midnight = JarvisComponents.Midnight
@@ -72,15 +89,29 @@ private val Green = JarvisComponents.Green
 
 class MainActivity : ComponentActivity() {
 
+    private enum class VoiceMode {
+        IDLE,
+        WAKE_WORD,
+        ACTIVATING,
+        COMMAND,
+    }
+
     private lateinit var devicePolicyManager: DevicePolicyManager
     private lateinit var adminComponent: ComponentName
     private var speechRecognizer: SpeechRecognizer? = null
     private var lockScreen: (() -> Unit)? = null
+    private var voiceMode = VoiceMode.IDLE
+    private var showActivationPopup by mutableStateOf(false)
+    private var textToSpeech: TextToSpeech? = null
+    private var isTextToSpeechReady = false
+    private var pendingSpeechCompletion: (() -> Unit)? = null
+    private val mainHandler = Handler(Looper.getMainLooper())
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         devicePolicyManager = getSystemService(DevicePolicyManager::class.java)
         adminComponent = ComponentName(this, JarvisDeviceAdminReceiver::class.java)
+        initializeTextToSpeech()
 
         setContent {
             JarvisTheme {
@@ -88,6 +119,7 @@ class MainActivity : ComponentActivity() {
                     isAdminActive = devicePolicyManager.isAdminActive(adminComponent),
                     isMicrophoneGranted = hasPermission(Manifest.permission.RECORD_AUDIO),
                     isSpeechAvailable = SpeechRecognizer.isRecognitionAvailable(this),
+                    showActivationPopup = showActivationPopup,
                     onEnableScreenLock = ::requestDeviceAdmin,
                     onLockNow = ::lockScreenNow,
                     onActivateJarvis = ::requestVoiceAccess,
@@ -104,6 +136,7 @@ class MainActivity : ComponentActivity() {
                     isAdminActive = devicePolicyManager.isAdminActive(adminComponent),
                     isMicrophoneGranted = hasPermission(Manifest.permission.RECORD_AUDIO),
                     isSpeechAvailable = SpeechRecognizer.isRecognitionAvailable(this),
+                    showActivationPopup = showActivationPopup,
                     onEnableScreenLock = ::requestDeviceAdmin,
                     onLockNow = ::lockScreenNow,
                     onActivateJarvis = ::requestVoiceAccess,
@@ -154,21 +187,78 @@ class MainActivity : ComponentActivity() {
         if (missingPermissions.isNotEmpty()) {
             permissionLauncher.launch(missingPermissions.toTypedArray())
         } else {
-            startVoiceRecognition()
+            startWakeWordRecognition()
         }
     }
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
             if (hasPermission(Manifest.permission.RECORD_AUDIO)) {
-                startVoiceRecognition()
+                startWakeWordRecognition()
             }
         }
 
-    private fun startVoiceRecognition() {
+    private fun initializeTextToSpeech() {
+        textToSpeech = TextToSpeech(this) { status ->
+            if (status == TextToSpeech.SUCCESS) {
+                textToSpeech?.let(::configureTextToSpeech)
+                isTextToSpeechReady = true
+                pendingSpeechCompletion?.let { completion ->
+                    pendingSpeechCompletion = null
+                    speakActivationMessage(completion)
+                }
+            } else {
+                isTextToSpeechReady = false
+                pendingSpeechCompletion?.invoke()
+                pendingSpeechCompletion = null
+            }
+        }
+    }
+
+    private fun configureTextToSpeech(speech: TextToSpeech) {
+        val languageResult = speech.setLanguage(Locale.US)
+        if (
+            languageResult == TextToSpeech.LANG_MISSING_DATA ||
+            languageResult == TextToSpeech.LANG_NOT_SUPPORTED
+        ) {
+            speech.language = Locale.getDefault()
+        }
+
+        val femaleVoice = speech.voices
+            ?.firstOrNull { voice ->
+                val isEnglish = voice.locale.language == Locale.ENGLISH
+                val describesFemaleVoice =
+                    voice.name.contains("female", ignoreCase = true) ||
+                        voice.features.orEmpty().any { it.contains("female", ignoreCase = true) }
+                isEnglish && describesFemaleVoice
+            }
+        if (femaleVoice != null) {
+            speech.voice = femaleVoice
+        }
+    }
+
+    private fun startWakeWordRecognition() {
         if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            finishVoiceSession()
             return
         }
+        mainHandler.removeCallbacksAndMessages(null)
+        voiceMode = VoiceMode.WAKE_WORD
+        showActivationPopup = false
+        startRecognition()
+    }
+
+    private fun startCommandRecognition() {
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
+            finishVoiceSession()
+            return
+        }
+        voiceMode = VoiceMode.COMMAND
+        startRecognition()
+    }
+
+    private fun startRecognition() {
+        val activeMode = voiceMode
         speechRecognizer?.destroy()
         speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this).also { recognizer ->
             recognizer.setRecognitionListener(object : RecognitionListener {
@@ -177,13 +267,41 @@ class MainActivity : ComponentActivity() {
                 override fun onRmsChanged(rmsdB: Float) = Unit
                 override fun onBufferReceived(buffer: ByteArray?) = Unit
                 override fun onEndOfSpeech() = Unit
-                override fun onError(error: Int) = Unit
+                override fun onError(error: Int) {
+                    if (voiceMode != activeMode) {
+                        return
+                    }
+                    speechRecognizer?.destroy()
+                    speechRecognizer = null
+                    if (activeMode == VoiceMode.WAKE_WORD) {
+                        scheduleWakeWordRecognition()
+                    } else {
+                        finishVoiceSession()
+                    }
+                }
+
                 override fun onResults(results: Bundle?) {
+                    if (voiceMode != activeMode) {
+                        return
+                    }
                     val phrases = results?.getStringArrayList(
                         SpeechRecognizer.RESULTS_RECOGNITION,
                     ).orEmpty()
-                    if (phrases.any(::isLockCommand)) {
-                        lockScreenNow()
+                    if (activeMode == VoiceMode.WAKE_WORD) {
+                        if (phrases.any(::isWakeWord)) {
+                            voiceMode = VoiceMode.ACTIVATING
+                            speechRecognizer?.cancel()
+                            showActivationPopup = true
+                            speakActivationMessage(::startCommandRecognition)
+                        } else {
+                            scheduleWakeWordRecognition()
+                        }
+                    } else {
+                        val lockRequested = phrases.any(::isLockCommand)
+                        finishVoiceSession()
+                        if (lockRequested) {
+                            lockScreenNow()
+                        }
                     }
                 }
                 override fun onPartialResults(partialResults: Bundle?) = Unit
@@ -200,6 +318,70 @@ class MainActivity : ComponentActivity() {
                     putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
                 },
             )
+        }
+    }
+
+    private fun scheduleWakeWordRecognition() {
+        if (voiceMode != VoiceMode.WAKE_WORD) {
+            return
+        }
+        mainHandler.removeCallbacksAndMessages(null)
+        mainHandler.postDelayed(
+            {
+                if (voiceMode == VoiceMode.WAKE_WORD) {
+                    startRecognition()
+                }
+            },
+            300L,
+        )
+    }
+
+    private fun isWakeWord(phrase: String): Boolean {
+        val normalized = phrase.lowercase(Locale.getDefault())
+            .replace(Regex("[^a-z0-9 ]"), " ")
+            .replace(Regex("\\s+"), " ")
+            .trim()
+        return normalized == "jarvis" ||
+            normalized == "hey jarvis" ||
+            normalized.startsWith("jarvis ") ||
+            normalized.startsWith("hey jarvis ")
+    }
+
+    private fun speakActivationMessage(onComplete: () -> Unit) {
+        val speech = textToSpeech
+        if (!isTextToSpeechReady || speech == null) {
+            pendingSpeechCompletion = onComplete
+            return
+        }
+
+        var completed = false
+        fun completeSpeech() {
+            if (completed) {
+                return
+            }
+            completed = true
+            runOnUiThread(onComplete)
+        }
+
+        speech.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
+            override fun onStart(utteranceId: String?) = Unit
+
+            override fun onDone(utteranceId: String?) {
+                completeSpeech()
+            }
+
+            override fun onError(utteranceId: String?) {
+                completeSpeech()
+            }
+        })
+        val result = speech.speak(
+            "Yes, I'm listening.",
+            TextToSpeech.QUEUE_FLUSH,
+            Bundle(),
+            "jarvis_activation",
+        )
+        if (result == TextToSpeech.ERROR) {
+            completeSpeech()
         }
     }
 
@@ -221,9 +403,21 @@ class MainActivity : ComponentActivity() {
         return normalized in commands
     }
 
-    override fun onDestroy() {
+    private fun finishVoiceSession() {
+        mainHandler.removeCallbacksAndMessages(null)
+        voiceMode = VoiceMode.IDLE
+        showActivationPopup = false
+        speechRecognizer?.cancel()
         speechRecognizer?.destroy()
         speechRecognizer = null
+    }
+
+    override fun onDestroy() {
+        finishVoiceSession()
+        pendingSpeechCompletion = null
+        textToSpeech?.stop()
+        textToSpeech?.shutdown()
+        textToSpeech = null
         super.onDestroy()
     }
 }
@@ -248,6 +442,7 @@ private fun JarvisScreen(
     isAdminActive: Boolean,
     isMicrophoneGranted: Boolean,
     isSpeechAvailable: Boolean,
+    showActivationPopup: Boolean,
     onEnableScreenLock: () -> Unit,
     onLockNow: () -> Unit,
     onActivateJarvis: () -> Unit,
@@ -384,6 +579,201 @@ private fun JarvisScreen(
                 )
                 Spacer(modifier = Modifier.height(10.dp))
             }
+
+            AnimatedVisibility(
+                visible = showActivationPopup,
+                modifier = Modifier.fillMaxSize(),
+                enter = fadeIn(animationSpec = tween(240)) +
+                    scaleIn(
+                        animationSpec = tween(360),
+                        initialScale = 0.82f,
+                    ),
+                exit = fadeOut(animationSpec = tween(220)) +
+                    scaleOut(
+                        animationSpec = tween(220),
+                        targetScale = 0.94f,
+                    ),
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .background(Color.Black.copy(alpha = 0.58f)),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    ActivationPopup()
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ActivationPopup() {
+    val infiniteTransition = rememberInfiniteTransition(label = "activation_popup")
+    val orbPulse by infiniteTransition.animateFloat(
+        initialValue = 0.92f,
+        targetValue = 1.08f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(900),
+            repeatMode = RepeatMode.Reverse,
+        ),
+        label = "orb_pulse",
+    )
+    val wavePhase by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = (Math.PI * 2).toFloat(),
+        animationSpec = infiniteRepeatable(
+            animation = tween(1300),
+            repeatMode = RepeatMode.Restart,
+        ),
+        label = "wave_phase",
+    )
+    val popupShape = RoundedCornerShape(28.dp)
+
+    Box(
+        modifier = Modifier
+            .width(312.dp)
+            .shadow(
+                elevation = 28.dp,
+                shape = popupShape,
+                ambientColor = Cyan.copy(alpha = 0.24f),
+                spotColor = Cyan.copy(alpha = 0.34f),
+            )
+            .clip(popupShape)
+            .background(
+                Brush.verticalGradient(
+                    colors = listOf(
+                        Color(0xE91A2B3D),
+                        Color(0xE90A121E),
+                    ),
+                ),
+            )
+            .border(
+                width = 1.dp,
+                brush = Brush.verticalGradient(
+                    colors = listOf(
+                        Cyan.copy(alpha = 0.82f),
+                        Color(0xFF1C657D).copy(alpha = 0.4f),
+                    ),
+                ),
+                shape = popupShape,
+            )
+            .padding(horizontal = 28.dp, vertical = 30.dp),
+        contentAlignment = Alignment.Center,
+    ) {
+        Column(
+            horizontalAlignment = Alignment.CenterHorizontally,
+        ) {
+            Box(
+                modifier = Modifier.size(148.dp),
+                contentAlignment = Alignment.Center,
+            ) {
+                AudioWaveRing(phase = wavePhase)
+                Box(
+                    modifier = Modifier
+                        .size((96f * orbPulse).dp)
+                        .clip(CircleShape)
+                        .background(
+                            Brush.radialGradient(
+                                colors = listOf(
+                                    Color(0xFFB8F5FF),
+                                    Cyan,
+                                    Color(0xFF0D536B),
+                                    Color.Transparent,
+                                ),
+                            ),
+                        )
+                        .border(1.dp, Color.White.copy(alpha = 0.72f), CircleShape),
+                )
+                Box(
+                    modifier = Modifier
+                        .size(42.dp)
+                        .clip(CircleShape)
+                        .background(
+                            Brush.radialGradient(
+                                colors = listOf(Color.White, Cyan, Color(0xFF1A89A8)),
+                            ),
+                        ),
+                )
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                text = "JARVIS",
+                color = Color.White,
+                fontSize = 23.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 5.sp,
+            )
+            Spacer(modifier = Modifier.height(8.dp))
+            Text(
+                text = "Yes, I'm listening...",
+                color = SoftCyan,
+                fontSize = 14.sp,
+                letterSpacing = 0.4.sp,
+            )
+            Spacer(modifier = Modifier.height(18.dp))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Default.Mic,
+                    contentDescription = "Listening",
+                    tint = Cyan,
+                    modifier = Modifier.size(17.dp),
+                )
+                Text(
+                    text = "LISTENING",
+                    color = Cyan,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 2.sp,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun AudioWaveRing(phase: Float) {
+    Canvas(modifier = Modifier.size(148.dp)) {
+        val center = androidx.compose.ui.geometry.Offset(
+            x = size.width / 2f,
+            y = size.height / 2f,
+        )
+        val baseRadius = size.minDimension * 0.36f
+        drawCircle(
+            color = Cyan.copy(alpha = 0.1f),
+            radius = baseRadius + 12.dp.toPx(),
+        )
+        drawCircle(
+            color = Cyan.copy(alpha = 0.52f),
+            radius = baseRadius + 9.dp.toPx(),
+            style = Stroke(width = 1.5.dp.toPx()),
+        )
+
+        repeat(16) { index ->
+            val angle = (index * (Math.PI * 2 / 16)).toFloat()
+            val waveHeight = (5f + 9f * (
+                0.5f + 0.5f * sin(phase + index * 0.7f)
+            )) * density
+            val innerRadius = baseRadius + 18.dp.toPx()
+            val outerRadius = innerRadius + waveHeight
+            val start = androidx.compose.ui.geometry.Offset(
+                x = center.x + cos(angle) * innerRadius,
+                y = center.y + sin(angle) * innerRadius,
+            )
+            val end = androidx.compose.ui.geometry.Offset(
+                x = center.x + cos(angle) * outerRadius,
+                y = center.y + sin(angle) * outerRadius,
+            )
+            drawLine(
+                color = Cyan.copy(alpha = 0.78f),
+                start = start,
+                end = end,
+                strokeWidth = 2.dp.toPx(),
+                cap = StrokeCap.Round,
+            )
         }
     }
 }
