@@ -190,14 +190,39 @@ class JarvisOverlayService : Service() {
         startRecognition()
     }
 
+    /**
+     * SOUND FIX: the default recognizer is the Google app's voice-search
+     * service, which plays its own "voice search" start/stop tone every time
+     * startListening() is called. The wake-word loop restarts it every few
+     * hundred milliseconds, producing the continuous beeping.
+     * On Android 12+ the on-device recognizer is used instead: it runs
+     * silently (no voice-search tone) and needs no UI. Older devices / devices
+     * without on-device models fall back to the default recognizer.
+     */
+    private fun createRecognizer(): SpeechRecognizer {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
+            SpeechRecognizer.isOnDeviceRecognitionAvailable(this)
+        ) {
+            try {
+                return SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
+            } catch (e: Exception) {
+                Log.w(TAG, "On-device recognizer unavailable, using default", e)
+            }
+        }
+        return SpeechRecognizer.createSpeechRecognizer(this)
+    }
+
     private fun startRecognition() {
         val activeMode = voiceMode
-        speechRecognizer?.destroy()
-        speechRecognizer = try {
-            SpeechRecognizer.createSpeechRecognizer(this)
-        } catch (e: Exception) {
-            Log.w(TAG, "SpeechRecognizer unavailable", e)
-            null
+        // Reuse one recognizer session instead of destroying/recreating it
+        // on every loop (each re-bind re-triggered the service start tone).
+        if (speechRecognizer == null) {
+            speechRecognizer = try {
+                createRecognizer()
+            } catch (e: Exception) {
+                Log.w(TAG, "SpeechRecognizer unavailable", e)
+                null
+            }
         }
         val recognizer = speechRecognizer ?: run {
             scheduleWakeWordRecognition(1000L)
@@ -214,14 +239,17 @@ class JarvisOverlayService : Service() {
 
             override fun onError(error: Int) {
                 if (voiceMode != activeMode) return
-                speechRecognizer?.destroy()
-                speechRecognizer = null
                 // Busy/throttled recognizers need a slightly longer pause.
                 val delay = when (error) {
                     SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
                     SpeechRecognizer.ERROR_CLIENT,
                     -> 1000L
                     else -> 300L
+                }
+                // Only a broken session is recreated; normal timeouts reuse it.
+                if (delay == 1000L) {
+                    speechRecognizer?.destroy()
+                    speechRecognizer = null
                 }
                 // A failed command attempt returns to waiting for the wake word.
                 voiceMode = VoiceMode.WAKE_WORD
@@ -265,6 +293,7 @@ class JarvisOverlayService : Service() {
                     putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
                     putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
                     putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
+                    putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
                 },
             )
         } catch (e: Exception) {
@@ -302,6 +331,7 @@ class JarvisOverlayService : Service() {
             "screen off",
             "screen lock",
             "lock my phone",
+            "lock my screen",
             "phone lock",
             "screen off chey",
             "phone lock chey",
