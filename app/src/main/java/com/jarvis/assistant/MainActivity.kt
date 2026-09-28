@@ -308,6 +308,11 @@ private fun JarvisScreen(
                     ready = isMicrophoneGranted && isSpeechAvailable,
                     onClick = onActivateJarvis,
                 )
+                Spacer(modifier = Modifier.height(12.dp))
+                AskJarvisCard(
+                    onLockScreen = onLockNow,
+                    onStopListening = onDeactivateJarvis,
+                )
 
                 Spacer(modifier = Modifier.weight(1f))
                 Button(
