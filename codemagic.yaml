@@ -1,18 +1,22 @@
 workflows:
   android-release:
     name: Android Release APK
+    instance_type: linux_x2
+    max_build_duration: 45
     environment:
       java: 17
+      vars:
+        GRADLE_OPTS: "-Dorg.gradle.daemon=false -Dorg.gradle.jvmargs=-Xmx3g"
     scripts:
       - name: Make Gradle wrapper executable
         script: chmod +x gradlew
       - name: Clean existing project
-        script: ./gradlew clean
+        script: ./gradlew clean --no-daemon --console=plain
       - name: Assemble and sign release APK
         script: |
           set -e
 
-          ./gradlew assembleRelease
+          ./gradlew assembleRelease --no-daemon --console=plain --stacktrace
 
           APK_DIR="app/build/outputs/apk/release"
           UNSIGNED_APK="$(find "$APK_DIR" -maxdepth 1 -type f -name '*unsigned.apk' -print -quit)"
