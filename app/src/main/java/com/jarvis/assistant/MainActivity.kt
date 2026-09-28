@@ -15,6 +15,7 @@ import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.provider.Settings
+import android.net.Uri
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -89,57 +90,39 @@ private val Green = JarvisComponents.Green
 
 class MainActivity : ComponentActivity() {
 
-    private enum class VoiceMode {
-        IDLE,
-        WAKE_WORD,
-        ACTIVATING,
-        COMMAND,
-    }
-
     private lateinit var devicePolicyManager: DevicePolicyManager
     private lateinit var adminComponent: ComponentName
-    private var speechRecognizer: SpeechRecognizer? = null
-    private var lockScreen: (() -> Unit)? = null
-    private var voiceMode = VoiceMode.IDLE
-    private var showActivationPopup by mutableStateOf(false)
-    private var textToSpeech: TextToSpeech? = null
-    private var isTextToSpeechReady = false
-    private var pendingSpeechCompletion: (() -> Unit)? = null
-    private val mainHandler = Handler(Looper.getMainLooper())
+    private var pendingActivationAfterOverlay = false
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
         devicePolicyManager = getSystemService(DevicePolicyManager::class.java)
         adminComponent = ComponentName(this, JarvisDeviceAdminReceiver::class.java)
-        initializeTextToSpeech()
-
-        setContent {
-            JarvisTheme {
-                JarvisScreen(
-                    isAdminActive = devicePolicyManager.isAdminActive(adminComponent),
-                    isMicrophoneGranted = hasPermission(Manifest.permission.RECORD_AUDIO),
-                    isSpeechAvailable = SpeechRecognizer.isRecognitionAvailable(this),
-                    showActivationPopup = showActivationPopup,
-                    onEnableScreenLock = ::requestDeviceAdmin,
-                    onLockNow = ::lockScreenNow,
-                    onActivateJarvis = ::requestVoiceAccess,
-                )
-            }
-        }
+        renderScreen()
     }
 
     override fun onResume() {
         super.onResume()
+        if (pendingActivationAfterOverlay) {
+            // Returning from the "display over other apps" settings screen.
+            pendingActivationAfterOverlay = false
+            startBackgroundListening()
+        }
+        renderScreen()
+    }
+
+    private fun renderScreen() {
         setContent {
             JarvisTheme {
                 JarvisScreen(
                     isAdminActive = devicePolicyManager.isAdminActive(adminComponent),
                     isMicrophoneGranted = hasPermission(Manifest.permission.RECORD_AUDIO),
                     isSpeechAvailable = SpeechRecognizer.isRecognitionAvailable(this),
-                    showActivationPopup = showActivationPopup,
+                    isJarvisActive = JarvisOverlayService.isActive.value,
                     onEnableScreenLock = ::requestDeviceAdmin,
                     onLockNow = ::lockScreenNow,
                     onActivateJarvis = ::requestVoiceAccess,
+                    onDeactivateJarvis = ::deactivateJarvis,
                 )
             }
         }
@@ -187,238 +170,46 @@ class MainActivity : ComponentActivity() {
         if (missingPermissions.isNotEmpty()) {
             permissionLauncher.launch(missingPermissions.toTypedArray())
         } else {
-            startWakeWordRecognition()
+            ensureOverlayPermissionThenStart()
         }
     }
 
     private val permissionLauncher =
         registerForActivityResult(ActivityResultContracts.RequestMultiplePermissions()) {
             if (hasPermission(Manifest.permission.RECORD_AUDIO)) {
-                startWakeWordRecognition()
-            }
-        }
-
-    private fun initializeTextToSpeech() {
-        textToSpeech = TextToSpeech(this) { status ->
-            if (status == TextToSpeech.SUCCESS) {
-                textToSpeech?.let(::configureTextToSpeech)
-                isTextToSpeechReady = true
-                pendingSpeechCompletion?.let { completion ->
-                    pendingSpeechCompletion = null
-                    speakActivationMessage(completion)
-                }
+                ensureOverlayPermissionThenStart()
             } else {
-                isTextToSpeechReady = false
-                pendingSpeechCompletion?.invoke()
-                pendingSpeechCompletion = null
+                renderScreen()
             }
         }
-    }
 
-    private fun configureTextToSpeech(speech: TextToSpeech) {
-        val languageResult = speech.setLanguage(Locale.US)
-        if (
-            languageResult == TextToSpeech.LANG_MISSING_DATA ||
-            languageResult == TextToSpeech.LANG_NOT_SUPPORTED
-        ) {
-            speech.language = Locale.getDefault()
-        }
-
-        val femaleVoice = speech.voices
-            ?.firstOrNull { voice ->
-                val isEnglish = voice.locale.language == Locale.ENGLISH.language
-                val describesFemaleVoice =
-                    voice.name.contains("female", ignoreCase = true) ||
-                        voice.features.orEmpty().any { it.contains("female", ignoreCase = true) }
-                isEnglish && describesFemaleVoice
-            }
-        if (femaleVoice != null) {
-            speech.voice = femaleVoice
-        }
-    }
-
-    private fun startWakeWordRecognition() {
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            finishVoiceSession()
-            return
-        }
-        mainHandler.removeCallbacksAndMessages(null)
-        voiceMode = VoiceMode.WAKE_WORD
-        showActivationPopup = false
-        startRecognition()
-    }
-
-    private fun startCommandRecognition() {
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            finishVoiceSession()
-            return
-        }
-        voiceMode = VoiceMode.COMMAND
-        startRecognition()
-    }
-
-    private fun startRecognition() {
-        val activeMode = voiceMode
-        speechRecognizer?.destroy()
-        speechRecognizer = SpeechRecognizer.createSpeechRecognizer(this).also { recognizer ->
-            recognizer.setRecognitionListener(object : RecognitionListener {
-                override fun onReadyForSpeech(params: Bundle?) = Unit
-                override fun onBeginningOfSpeech() = Unit
-                override fun onRmsChanged(rmsdB: Float) = Unit
-                override fun onBufferReceived(buffer: ByteArray?) = Unit
-                override fun onEndOfSpeech() = Unit
-                override fun onError(error: Int) {
-                    if (voiceMode != activeMode) {
-                        return
-                    }
-                    speechRecognizer?.destroy()
-                    speechRecognizer = null
-                    if (activeMode == VoiceMode.WAKE_WORD) {
-                        scheduleWakeWordRecognition()
-                    } else {
-                        finishVoiceSession()
-                    }
-                }
-
-                override fun onResults(results: Bundle?) {
-                    if (voiceMode != activeMode) {
-                        return
-                    }
-                    val phrases = results?.getStringArrayList(
-                        SpeechRecognizer.RESULTS_RECOGNITION,
-                    ).orEmpty()
-                    if (activeMode == VoiceMode.WAKE_WORD) {
-                        if (phrases.any(::isWakeWord)) {
-                            voiceMode = VoiceMode.ACTIVATING
-                            speechRecognizer?.cancel()
-                            showActivationPopup = true
-                            speakActivationMessage(::startCommandRecognition)
-                        } else {
-                            scheduleWakeWordRecognition()
-                        }
-                    } else {
-                        val lockRequested = phrases.any(::isLockCommand)
-                        finishVoiceSession()
-                        if (lockRequested) {
-                            lockScreenNow()
-                        }
-                    }
-                }
-                override fun onPartialResults(partialResults: Bundle?) = Unit
-                override fun onEvent(eventType: Int, params: Bundle?) = Unit
-            })
-            recognizer.startListening(
-                Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                    putExtra(
-                        RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                        RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
-                    )
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
-                    putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
-                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
-                },
+    /** The popup over other apps needs "Display over other apps". */
+    private fun ensureOverlayPermissionThenStart() {
+        if (!Settings.canDrawOverlays(this)) {
+            pendingActivationAfterOverlay = true
+            startActivity(
+                Intent(
+                    Settings.ACTION_MANAGE_OVERLAY_PERMISSION,
+                    Uri.parse("package:$packageName"),
+                ),
             )
+        } else {
+            startBackgroundListening()
         }
     }
 
-    private fun scheduleWakeWordRecognition() {
-        if (voiceMode != VoiceMode.WAKE_WORD) {
-            return
-        }
-        mainHandler.removeCallbacksAndMessages(null)
-        mainHandler.postDelayed(
-            {
-                if (voiceMode == VoiceMode.WAKE_WORD) {
-                    startRecognition()
-                }
-            },
-            300L,
-        )
+    private fun startBackgroundListening() {
+        if (!hasPermission(Manifest.permission.RECORD_AUDIO)) return
+        if (!SpeechRecognizer.isRecognitionAvailable(this)) return
+        // Started while JARVIS is visible, as Android requires for microphone services.
+        JarvisOverlayService.start(this)
+        JarvisOverlayService.isActive.value = true
+        renderScreen()
     }
 
-    private fun isWakeWord(phrase: String): Boolean {
-        val normalized = phrase.lowercase(Locale.getDefault())
-            .replace(Regex("[^a-z0-9 ]"), " ")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-        return normalized == "jarvis" ||
-            normalized == "hey jarvis" ||
-            normalized.startsWith("jarvis ") ||
-            normalized.startsWith("hey jarvis ")
-    }
-
-    private fun speakActivationMessage(onComplete: () -> Unit) {
-        val speech = textToSpeech
-        if (!isTextToSpeechReady || speech == null) {
-            pendingSpeechCompletion = onComplete
-            return
-        }
-
-        var completed = false
-        fun completeSpeech() {
-            if (completed) {
-                return
-            }
-            completed = true
-            runOnUiThread(onComplete)
-        }
-
-        speech.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(utteranceId: String?) = Unit
-
-            override fun onDone(utteranceId: String?) {
-                completeSpeech()
-            }
-
-            override fun onError(utteranceId: String?) {
-                completeSpeech()
-            }
-        })
-        val result = speech.speak(
-            "Yes, I'm listening.",
-            TextToSpeech.QUEUE_FLUSH,
-            Bundle(),
-            "jarvis_activation",
-        )
-        if (result == TextToSpeech.ERROR) {
-            completeSpeech()
-        }
-    }
-
-    private fun isLockCommand(phrase: String): Boolean {
-        val normalized = phrase.lowercase(Locale.getDefault())
-            .replace(Regex("[^a-z0-9 ]"), " ")
-            .replace(Regex("\\s+"), " ")
-            .trim()
-        val commands = setOf(
-            "screen off",
-            "screen lock",
-            "lock my phone",
-            "phone lock",
-            "screen off chey",
-            "phone lock chey",
-            "screen ni off chey",
-            "lock chey",
-        )
-        return normalized in commands
-    }
-
-    private fun finishVoiceSession() {
-        mainHandler.removeCallbacksAndMessages(null)
-        voiceMode = VoiceMode.IDLE
-        showActivationPopup = false
-        speechRecognizer?.cancel()
-        speechRecognizer?.destroy()
-        speechRecognizer = null
-    }
-
-    override fun onDestroy() {
-        finishVoiceSession()
-        pendingSpeechCompletion = null
-        textToSpeech?.stop()
-        textToSpeech?.shutdown()
-        textToSpeech = null
-        super.onDestroy()
+    private fun deactivateJarvis() {
+        JarvisOverlayService.stop(this)
+        renderScreen()
     }
 }
 
@@ -442,12 +233,14 @@ private fun JarvisScreen(
     isAdminActive: Boolean,
     isMicrophoneGranted: Boolean,
     isSpeechAvailable: Boolean,
-    showActivationPopup: Boolean,
+    isJarvisActive: Boolean,
     onEnableScreenLock: () -> Unit,
     onLockNow: () -> Unit,
     onActivateJarvis: () -> Unit,
+    onDeactivateJarvis: () -> Unit,
 ) {
-    var activated by remember { mutableStateOf(false) }
+    val activated = isJarvisActive
+    val showActivationPopup = false
     val status = when {
         activated && isMicrophoneGranted -> "LISTENING FOR COMMANDS"
         !isSpeechAvailable -> "VOICE SERVICE UNAVAILABLE"
@@ -554,8 +347,7 @@ private fun JarvisScreen(
                 Spacer(modifier = Modifier.height(12.dp))
                 Button(
                     onClick = {
-                        activated = true
-                        onActivateJarvis()
+                        if (activated) onDeactivateJarvis() else onActivateJarvis()
                     },
                     modifier = Modifier
                         .fillMaxWidth()
@@ -568,7 +360,7 @@ private fun JarvisScreen(
                 ) {
                     Icon(Icons.Default.Mic, contentDescription = null)
                     Spacer(modifier = Modifier.width(10.dp))
-                    Text("ACTIVATE JARVIS", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
+                    Text(if (activated) "DEACTIVATE JARVIS" else "ACTIVATE JARVIS", fontWeight = FontWeight.Bold, letterSpacing = 1.sp)
                 }
                 Spacer(modifier = Modifier.height(16.dp))
                 Text(
@@ -608,7 +400,7 @@ private fun JarvisScreen(
 }
 
 @Composable
-private fun ActivationPopup() {
+internal fun ActivationPopup() {
     val infiniteTransition = rememberInfiniteTransition(label = "activation_popup")
     val orbPulse by infiniteTransition.animateFloat(
         initialValue = 0.92f,
