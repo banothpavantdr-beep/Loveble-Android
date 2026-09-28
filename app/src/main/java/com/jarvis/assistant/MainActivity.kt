@@ -226,7 +226,7 @@ class MainActivity : ComponentActivity() {
 
         val femaleVoice = speech.voices
             ?.firstOrNull { voice ->
-                val isEnglish = voice.locale.language == Locale.ENGLISH
+                val isEnglish = voice.locale.language == Locale.ENGLISH.language
                 val describesFemaleVoice =
                     voice.name.contains("female", ignoreCase = true) ||
                         voice.features.orEmpty().any { it.contains("female", ignoreCase = true) }
