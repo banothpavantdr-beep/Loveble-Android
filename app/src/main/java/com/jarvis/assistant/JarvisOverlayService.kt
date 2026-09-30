@@ -19,9 +19,6 @@ import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
 import android.provider.Settings
-import android.speech.RecognitionListener
-import android.speech.RecognizerIntent
-import android.speech.SpeechRecognizer
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
 import android.util.Log
@@ -49,6 +46,11 @@ import androidx.savedstate.SavedStateRegistryController
 import androidx.savedstate.SavedStateRegistryOwner
 import androidx.savedstate.setViewTreeSavedStateRegistryOwner
 import java.util.Locale
+import org.vosk.Model
+import org.vosk.Recognizer
+import org.vosk.android.RecognitionListener
+import org.vosk.android.SpeechService
+import org.vosk.android.StorageService
 
 /**
  * Foreground service that keeps JARVIS listening for the wake word
@@ -56,7 +58,7 @@ import java.util.Locale
  *
  * - Started only when the user taps ACTIVATE JARVIS (app in foreground).
  * - Shows a persistent notification with a Deactivate action.
- * - Uses the on-device SpeechRecognizer; nothing is recorded or uploaded by JARVIS.
+ * - Uses the offline Vosk engine (silent AudioRecord); nothing is recorded or uploaded.
  * - On wake word: shows the activation popup over the current app, speaks
  *   "Yes, I'm listening.", then listens for the actual command.
  */
@@ -68,6 +70,11 @@ class JarvisOverlayService : Service() {
         private const val NOTIFICATION_ID = 1001
         private const val ACTION_START = "com.jarvis.assistant.action.START_LISTENING"
         private const val ACTION_STOP = "com.jarvis.assistant.action.STOP_LISTENING"
+        private const val SAMPLE_RATE = 16000f
+        private const val COMMAND_TIMEOUT_MS = 8000L
+        private const val VOSK_GRAMMAR =
+            "[\"hey jarvis\", \"jarvis\", \"screen off\", \"screen lock\", " +
+                "\"lock my phone\", \"lock my screen\", \"phone lock\", \"[unk]\"]"
 
         /** Observable by the UI so the button reflects the real state. */
         val isActive = mutableStateOf(false)
@@ -86,7 +93,10 @@ class JarvisOverlayService : Service() {
     private enum class VoiceMode { IDLE, WAKE_WORD, ACTIVATING, COMMAND }
 
     private val mainHandler = Handler(Looper.getMainLooper())
-    private var speechRecognizer: SpeechRecognizer? = null
+    private var voskModel: Model? = null
+    private var recognizer: Recognizer? = null
+    private var speechService: SpeechService? = null
+    private var isModelLoading = false
     private var voiceMode = VoiceMode.IDLE
     private var textToSpeech: TextToSpeech? = null
     private var isTextToSpeechReady = false
@@ -146,6 +156,8 @@ class JarvisOverlayService : Service() {
         textToSpeech?.stop()
         textToSpeech?.shutdown()
         textToSpeech = null
+        voskModel?.close()
+        voskModel = null
         isActive.value = false
         super.onDestroy()
     }
@@ -166,150 +178,148 @@ class JarvisOverlayService : Service() {
         mainHandler.removeCallbacksAndMessages(null)
         voiceMode = VoiceMode.IDLE
         hideOverlay()
-        speechRecognizer?.cancel()
-        speechRecognizer?.destroy()
-        speechRecognizer = null
+        releaseRecognizer()
     }
 
-    // ---------- Speech recognition ----------
+    // ---------- Speech recognition (offline Vosk, AudioRecord) ----------
 
+    /**
+     * BEEP FIX: android.speech.SpeechRecognizer.startListening() hands the
+     * microphone to Google's recognition service, which plays its own
+     * start/stop earcon every session. The wake-word loop restarted it every
+     * few hundred milliseconds, so the chime repeated constantly.
+     *
+     * JARVIS now listens with the offline Vosk engine, which reads the mic
+     * directly through AudioRecord. AudioRecord never plays any sound, and a
+     * single continuous session is used (no restart loop), so there is no
+     * beep. Exactly one engine (this SpeechService) owns the microphone.
+     */
     private fun startWakeWordRecognition() {
-        if (!SpeechRecognizer.isRecognitionAvailable(this)) {
-            stopListeningAndSelf()
-            return
-        }
         mainHandler.removeCallbacksAndMessages(null)
         voiceMode = VoiceMode.WAKE_WORD
         hideOverlay()
-        startRecognition()
+        val model = voskModel
+        if (model == null) {
+            loadModelThenListen()
+            return
+        }
+        startVoskService(model)
+        speechService?.setPause(false)
+    }
+
+    private fun loadModelThenListen() {
+        if (isModelLoading) return
+        isModelLoading = true
+        StorageService.unpack(
+            this,
+            "model-en-us",
+            "model",
+            { model ->
+                isModelLoading = false
+                voskModel = model
+                if (voiceMode == VoiceMode.WAKE_WORD) startWakeWordRecognition()
+            },
+            { e ->
+                isModelLoading = false
+                Log.w(TAG, "Unable to load offline speech model", e)
+                stopListeningAndSelf()
+            },
+        )
+    }
+
+    private fun startVoskService(model: Model) {
+        if (speechService != null) return
+        try {
+            val rec = Recognizer(model, SAMPLE_RATE, VOSK_GRAMMAR)
+            recognizer = rec
+            speechService = SpeechService(rec, SAMPLE_RATE).also {
+                it.startListening(voskListener)
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "Offline recognizer failed to start", e)
+            releaseRecognizer()
+            mainHandler.postDelayed(
+                { if (voiceMode == VoiceMode.WAKE_WORD) startWakeWordRecognition() },
+                1000L,
+            )
+        }
+    }
+
+    private fun releaseRecognizer() {
+        speechService?.stop()
+        speechService?.shutdown()
+        speechService = null
+        recognizer?.close()
+        recognizer = null
     }
 
     private fun startCommandRecognition() {
         if (voiceMode != VoiceMode.ACTIVATING) return
         voiceMode = VoiceMode.COMMAND
-        startRecognition()
-    }
-
-    /**
-     * SOUND FIX: the default recognizer is the Google app's voice-search
-     * service, which plays its own "voice search" start/stop tone every time
-     * startListening() is called. The wake-word loop restarts it every few
-     * hundred milliseconds, producing the continuous beeping.
-     * On Android 12+ the on-device recognizer is used instead: it runs
-     * silently (no voice-search tone) and needs no UI. Older devices / devices
-     * without on-device models fall back to the default recognizer.
-     */
-    private fun createRecognizer(): SpeechRecognizer {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S &&
-            SpeechRecognizer.isOnDeviceRecognitionAvailable(this)
-        ) {
-            try {
-                return SpeechRecognizer.createOnDeviceSpeechRecognizer(this)
-            } catch (e: Exception) {
-                Log.w(TAG, "On-device recognizer unavailable, using default", e)
-            }
-        }
-        return SpeechRecognizer.createSpeechRecognizer(this)
-    }
-
-    private fun startRecognition() {
-        val activeMode = voiceMode
-        // Reuse one recognizer session instead of destroying/recreating it
-        // on every loop (each re-bind re-triggered the service start tone).
-        if (speechRecognizer == null) {
-            speechRecognizer = try {
-                createRecognizer()
-            } catch (e: Exception) {
-                Log.w(TAG, "SpeechRecognizer unavailable", e)
-                null
-            }
-        }
-        val recognizer = speechRecognizer ?: run {
-            scheduleWakeWordRecognition(1000L)
-            return
-        }
-        recognizer.setRecognitionListener(object : RecognitionListener {
-            override fun onReadyForSpeech(params: Bundle?) = Unit
-            override fun onBeginningOfSpeech() = Unit
-            override fun onRmsChanged(rmsdB: Float) = Unit
-            override fun onBufferReceived(buffer: ByteArray?) = Unit
-            override fun onEndOfSpeech() = Unit
-            override fun onPartialResults(partialResults: Bundle?) = Unit
-            override fun onEvent(eventType: Int, params: Bundle?) = Unit
-
-            override fun onError(error: Int) {
-                if (voiceMode != activeMode) return
-                // Busy/throttled recognizers need a slightly longer pause.
-                val delay = when (error) {
-                    SpeechRecognizer.ERROR_RECOGNIZER_BUSY,
-                    SpeechRecognizer.ERROR_CLIENT,
-                    -> 1000L
-                    else -> 300L
-                }
-                // Only a broken session is recreated; normal timeouts reuse it.
-                if (delay == 1000L) {
-                    speechRecognizer?.destroy()
-                    speechRecognizer = null
-                }
-                // A failed command attempt returns to waiting for the wake word.
-                voiceMode = VoiceMode.WAKE_WORD
-                hideOverlay()
-                scheduleWakeWordRecognition(delay)
-            }
-
-            override fun onResults(results: Bundle?) {
-                if (voiceMode != activeMode) return
-                val phrases = results?.getStringArrayList(
-                    SpeechRecognizer.RESULTS_RECOGNITION,
-                ).orEmpty()
-                if (activeMode == VoiceMode.WAKE_WORD) {
-                    if (phrases.any(::isWakeWord)) {
-                        voiceMode = VoiceMode.ACTIVATING
-                        speechRecognizer?.cancel()
-                        showOverlay()
-                        // The wake word itself is never treated as a command:
-                        // a fresh recognition session starts after the reply.
-                        speakActivationMessage(::startCommandRecognition)
-                    } else {
-                        scheduleWakeWordRecognition(300L)
-                    }
-                } else {
-                    val lockRequested = phrases.any(::isLockCommand)
+        recognizer?.reset()
+        speechService?.setPause(false)
+        // Same timeout behaviour as before: no command -> back to wake word.
+        mainHandler.postDelayed(
+            {
+                if (voiceMode == VoiceMode.COMMAND) {
                     voiceMode = VoiceMode.WAKE_WORD
                     hideOverlay()
-                    if (lockRequested) lockScreenNow()
-                    scheduleWakeWordRecognition(600L)
+                }
+            },
+            COMMAND_TIMEOUT_MS,
+        )
+    }
+
+    private val voskListener = object : RecognitionListener {
+        override fun onPartialResult(hypothesis: String?) = Unit
+        override fun onFinalResult(hypothesis: String?) = Unit
+        override fun onTimeout() = Unit
+
+        override fun onError(exception: Exception?) {
+            Log.w(TAG, "Offline recognizer error", exception)
+            mainHandler.post {
+                releaseRecognizer()
+                if (voiceMode != VoiceMode.IDLE) {
+                    voiceMode = VoiceMode.WAKE_WORD
+                    hideOverlay()
+                    mainHandler.postDelayed(
+                        { if (voiceMode == VoiceMode.WAKE_WORD) startWakeWordRecognition() },
+                        1000L,
+                    )
                 }
             }
-        })
-        try {
-            recognizer.startListening(
-                Intent(RecognizerIntent.ACTION_RECOGNIZE_SPEECH).apply {
-                    putExtra(
-                        RecognizerIntent.EXTRA_LANGUAGE_MODEL,
-                        RecognizerIntent.LANGUAGE_MODEL_FREE_FORM,
-                    )
-                    putExtra(RecognizerIntent.EXTRA_LANGUAGE, Locale.getDefault())
-                    putExtra(RecognizerIntent.EXTRA_PARTIAL_RESULTS, false)
-                    putExtra(RecognizerIntent.EXTRA_MAX_RESULTS, 5)
-                    putExtra(RecognizerIntent.EXTRA_CALLING_PACKAGE, packageName)
-                    putExtra(RecognizerIntent.EXTRA_PREFER_OFFLINE, true)
-                },
-            )
-        } catch (e: Exception) {
-            Log.w(TAG, "startListening failed", e)
-            voiceMode = VoiceMode.WAKE_WORD
-            scheduleWakeWordRecognition(1000L)
+        }
+
+        override fun onResult(hypothesis: String?) {
+            val phrase = try {
+                org.json.JSONObject(hypothesis ?: return).optString("text")
+            } catch (e: Exception) {
+                return
+            }
+            if (phrase.isBlank()) return
+            mainHandler.post { handlePhrase(phrase) }
         }
     }
 
-    private fun scheduleWakeWordRecognition(delayMs: Long) {
-        if (voiceMode != VoiceMode.WAKE_WORD) return
-        mainHandler.removeCallbacksAndMessages(null)
-        mainHandler.postDelayed(
-            { if (voiceMode == VoiceMode.WAKE_WORD) startRecognition() },
-            delayMs,
-        )
+    private fun handlePhrase(phrase: String) {
+        when (voiceMode) {
+            VoiceMode.WAKE_WORD -> if (isWakeWord(phrase)) {
+                voiceMode = VoiceMode.ACTIVATING
+                // Stop hearing JARVIS's own reply; the wake word itself is
+                // never treated as a command.
+                speechService?.setPause(true)
+                showOverlay()
+                speakActivationMessage(::startCommandRecognition)
+            }
+            VoiceMode.COMMAND -> {
+                mainHandler.removeCallbacksAndMessages(null)
+                val lockRequested = isLockCommand(phrase)
+                voiceMode = VoiceMode.WAKE_WORD
+                hideOverlay()
+                if (lockRequested) lockScreenNow()
+            }
+            else -> Unit
+        }
     }
 
     private fun normalize(phrase: String): String =
